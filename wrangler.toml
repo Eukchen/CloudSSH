@@ -1,7 +1,7 @@
 name = "cloudssh"
 main = "src/worker/index.ts"
 compatibility_date = "2026-07-01"
-workers_dev = true
+workers_dev = false
 preview_urls = false
 
 [vars]
@@ -17,6 +17,10 @@ REQUIRE_GITHUB_AUTH = "true"
 STRICT_HOST_KEY_VERIFY = "true"
 
 GITHUB_ALLOWED_USER_IDS = "82923795"
+
+GITHUB_CLIENT_ID = "Ov23liBKasT3kLOzbuuj"
+
+BASE_URL = "https://ssh.fvvv.de"
 
 # 构建监视路径：仅源代码变动时触发重新构建
 [build]
