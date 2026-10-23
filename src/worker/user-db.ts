@@ -1,6 +1,11 @@
 import { normalizeAIBaseUrl } from '../ai-endpoint';
+import { resolveAIModelBudgets } from '../ai-model-policy';
 import { ServerMemoryStore } from './server-memory-store';
+import { distillMemory } from './agent/memory';
+import { ResponsesError } from './agent/responses-client';
+import type { AIConfig } from './agent/types';
 import { normalizeSnippetInput, SNIPPET_MAX_COUNT } from '../snippet-schema';
+import { normalizeMobileShortcutsPayload } from '../mobile-shortcuts-schema';
 import { normalizeUserThemePayload } from '../theme-schema';
 import {
   ALLOWED_LOCATION_HINTS,
@@ -14,7 +19,7 @@ import { isDetectedOS } from './os-detect';
 import { deserializeServerRow, serializeServerTags } from './server-tags';
 import { isValidTunnelHostname } from './tunnel-stream';
 
-const AUTH_METHODS = new Set(['password', 'publickey']);
+const AUTH_METHODS = new Set(['password', 'publickey', 'none']);
 const MAX_JUMP_HOSTS = 3;
 
 // 单管理员密码登录节流（DO 持久化，跨 isolate 权威；指数退避封顶 15 分钟）
@@ -100,8 +105,9 @@ function formatServerResponse(row: ServerRow) {
 type ShareMetaRow = { user_id: number; server_id: number; share_ref: string; status: string };
 type ThemeRow = { theme_data: string };
 type FingerprintRow = { fingerprint: string };
-type AIConfigRow = { base_url: string; model: string; api_key_last4: string; updated_at: string };
-type AIConfigSecretRow = { base_url: string; model: string; api_key_enc: string };
+type AIBudgetRow = { context_window?: number | null; max_output_tokens?: number | null };
+type AIConfigRow = AIBudgetRow & { base_url: string; model: string; api_key_last4: string; updated_at: string };
+type AIConfigSecretRow = AIBudgetRow & { base_url: string; model: string; api_key_enc: string };
 
 /**
  * UserDBDO — 按 GitHub 用户 ID 命名并隔离的用户数据库 Durable Object
@@ -121,6 +127,7 @@ export class UserDBDO {
   private static readonly MAX_CONNECT_TOKENS = 1000;
   private derivedKeyCache: Map<number, CryptoKey> = new Map();
   private memoryStore: ServerMemoryStore;
+  private memoryRun: Promise<void> | null = null;
 
   constructor(state: DurableObjectState, env: Env) {
     this.env = env;
@@ -130,7 +137,45 @@ export class UserDBDO {
       callback => typeof (state.storage as any).transactionSync === 'function'
         ? (state.storage as any).transactionSync(callback) : callback(),
       (value, userId) => this.encryptCredential(value, userId),
-      (value, userId) => this.decryptCredential(value, userId));
+      (value, userId) => this.decryptCredential(value, userId),
+      async at => { if (typeof state.storage.setAlarm === 'function') await state.storage.setAlarm(at); });
+    // Old pending rows become recoverable after deployment/reconstruction, without a live SSH tab.
+    if (typeof state.blockConcurrencyWhile === 'function') {
+      state.blockConcurrencyWhile(() => this.memoryStore.rearm());
+    }
+  }
+
+  async alarm(): Promise<void> {
+    if (!this.memoryRun) this.memoryRun = this.processMemoryTask().finally(() => { this.memoryRun = null; });
+    await this.memoryRun;
+  }
+
+  private async processMemoryTask(): Promise<void> {
+    const row = this.memoryStore.nextTask();
+    await this.memoryStore.rearm();
+    if (!row) return;
+    const controller = new AbortController();
+    let timer!: ReturnType<typeof setTimeout>;
+    const expired = new Promise<never>((_resolve, reject) => {
+      timer = setTimeout(() => { controller.abort('memory_timeout'); reject(new ResponsesError('responses_timeout')); }, 25_000);
+    });
+    try {
+      await Promise.race([expired, (async () => {
+        const task = await this.memoryStore.taskInput(row);
+        const response = await this.handleGetAIConfigDecrypted(row.user_id);
+        if (!response.ok) throw new ResponsesError('ai_not_configured');
+        const config = await response.json<AIConfig>();
+        const memory = await this.memoryStore.read(row.server_id, row.user_id);
+        controller.signal.throwIfAborted();
+        const batch = await distillMemory(config, task, memory, controller.signal);
+        await this.memoryStore.saveBatch(row.server_id, row.user_id, batch, row, controller.signal);
+      })()]);
+    } catch {
+      this.memoryStore.retryTask(row);
+    } finally {
+      clearTimeout(timer);
+      await this.memoryStore.rearm();
+    }
   }
 
   /**
@@ -201,6 +246,12 @@ export class UserDBDO {
         updated_at  TEXT DEFAULT (datetime('now'))
       );
 
+      CREATE TABLE IF NOT EXISTS user_mobile_shortcuts (
+        user_id         INTEGER PRIMARY KEY REFERENCES users(id),
+        shortcuts_data  TEXT NOT NULL,
+        updated_at      TEXT DEFAULT (datetime('now'))
+      );
+
       CREATE TABLE IF NOT EXISTS known_hosts (
         id          INTEGER PRIMARY KEY AUTOINCREMENT,
         user_id     INTEGER NOT NULL REFERENCES users(id),
@@ -220,6 +271,8 @@ export class UserDBDO {
         model          TEXT NOT NULL,
         api_key_enc    TEXT NOT NULL,
         api_key_last4  TEXT,
+        context_window INTEGER NOT NULL DEFAULT 64000,
+        max_output_tokens INTEGER NOT NULL DEFAULT 8192,
         updated_at     TEXT DEFAULT (datetime('now'))
       );
 
@@ -285,6 +338,14 @@ export class UserDBDO {
         last_fail_at  INTEGER NOT NULL DEFAULT 0
       );
     `);
+
+    const aiColumns = this.db.exec('PRAGMA table_info(ai_configs)').toArray();
+    if (!aiColumns.some((column: any) => column.name === 'context_window')) {
+      this.db.exec('ALTER TABLE ai_configs ADD COLUMN context_window INTEGER NOT NULL DEFAULT 64000');
+    }
+    if (!aiColumns.some((column: any) => column.name === 'max_output_tokens')) {
+      this.db.exec('ALTER TABLE ai_configs ADD COLUMN max_output_tokens INTEGER NOT NULL DEFAULT 8192');
+    }
 
     // === Migration: 给既有 servers 表追加 region / inferred_hint 列（幂等） ===
     // SQLite 没有 ADD COLUMN IF NOT EXISTS，用 PRAGMA table_info 守卫
@@ -436,16 +497,9 @@ export class UserDBDO {
         return this.handleUpdateServerOS(parseInt(osMatch[1], 10), request);
       }
 
-      const agentMemoryMatch = path.match(/^\/internal\/servers\/(\d+)\/agent-(session|checkpoint)$/);
-      if (agentMemoryMatch && ['GET', 'POST', 'DELETE'].includes(request.method)) {
-        return this.memoryStore.handle(Number(agentMemoryMatch[1]), agentMemoryMatch[2] === 'session' ? 'session' : 'checkpoint', request);
-      }
-
-      // /internal/servers/:id/memory/batch
-      const batchMemoryMatch = path.match(/^\/internal\/servers\/(\d+)\/memory\/batch$/);
-      if (batchMemoryMatch && request.method === 'POST') {
-        const serverId = parseInt(batchMemoryMatch[1], 10);
-        return this.memoryStore.handle(serverId, 'batch', request);
+      const agentMemoryMatch = path.match(/^\/internal\/servers\/(\d+)\/agent-memory$/);
+      if (agentMemoryMatch && request.method === 'POST') {
+        return this.memoryStore.handle(Number(agentMemoryMatch[1]), 'task', request);
       }
 
       // /internal/servers/:id/memory
@@ -515,6 +569,25 @@ export class UserDBDO {
         const userId = parseInt(userIdStr, 10);
         if (isNaN(userId)) return Response.json({ error: 'Invalid user_id' }, { status: 400 });
         return this.handleDeleteTheme(userId, url.searchParams.get('theme_id'));
+      }
+
+      // --- 移动端快捷键配置 ---
+      if (path === '/internal/mobile-shortcuts' && request.method === 'GET') {
+        const userIdStr = url.searchParams.get('user_id');
+        if (!userIdStr) return Response.json({ error: 'Missing user_id' }, { status: 400 });
+        const userId = parseInt(userIdStr, 10);
+        if (isNaN(userId)) return Response.json({ error: 'Invalid user_id' }, { status: 400 });
+        return this.handleGetMobileShortcuts(userId);
+      }
+      if (path === '/internal/mobile-shortcuts' && request.method === 'PUT') {
+        return this.handlePutMobileShortcuts(request);
+      }
+      if (path === '/internal/mobile-shortcuts' && request.method === 'DELETE') {
+        const userIdStr = url.searchParams.get('user_id');
+        if (!userIdStr) return Response.json({ error: 'Missing user_id' }, { status: 400 });
+        const userId = parseInt(userIdStr, 10);
+        if (isNaN(userId)) return Response.json({ error: 'Invalid user_id' }, { status: 400 });
+        return this.handleDeleteMobileShortcuts(userId);
       }
       // --- One-time-token 消费 ---
       if (path === '/internal/connect-token/consume' && request.method === 'POST') {
@@ -868,7 +941,11 @@ export class UserDBDO {
     if (!AUTH_METHODS.has(body.auth_method)) {
       return Response.json({ error: '不支持的认证方式' }, { status: 400 });
     }
-    if (typeof body.credential !== 'string' || body.credential.length === 0) {
+    if (
+      body.auth_method !== 'none' &&
+      (typeof body.credential !== 'string' ||
+        (body.auth_method === 'publickey' && body.credential.length === 0))
+    ) {
       return Response.json({ error: '认证凭据不能为空' }, { status: 400 });
     }
     const jumpServerId = body.jump_server_id ?? null;
@@ -926,8 +1003,9 @@ export class UserDBDO {
     // 下游节点或隧道连接不需要推断区域。
     const region = jumpServerId === null ? requestedRegion : null;
 
-    // 加密凭据
-    const encrypted = await this.encryptCredential(body.credential, body.user_id);
+    // none 不保存密码/私钥；沿用现有 NOT NULL 列，无需数据库迁移。
+    const encrypted =
+      body.auth_method === 'none' ? '' : await this.encryptCredential(body.credential, body.user_id);
 
     // Auto 模式保存时一次性推断 locationHint，结果持久化入 inferred_hint 列
     // 手动区域已经能够直接决定调度，无需向 IPinfo 发送主机信息
@@ -1027,13 +1105,18 @@ export class UserDBDO {
     if (body.auth_method !== undefined && !AUTH_METHODS.has(body.auth_method)) {
       return Response.json({ error: '不支持的认证方式' }, { status: 400 });
     }
-    const hasNewCredential = typeof body.credential === 'string' && body.credential.length > 0;
-    if (body.credential !== undefined && !hasNewCredential) {
+    const nextAuthMethod = body.auth_method ?? current.auth_method;
+    // Omitted means keep the stored credential; '' is an explicit empty password.
+    const hasNewCredential =
+      typeof body.credential === 'string' &&
+      (nextAuthMethod === 'password' || body.credential.length > 0);
+    if (nextAuthMethod !== 'none' && body.credential !== undefined && !hasNewCredential) {
       return Response.json({ error: '认证凭据不能为空' }, { status: 400 });
     }
     if (
       body.auth_method !== undefined &&
       body.auth_method !== current.auth_method &&
+      nextAuthMethod !== 'none' &&
       !hasNewCredential
     ) {
       return Response.json({ error: '切换认证方式时必须同时提供对应凭据' }, { status: 400 });
@@ -1127,7 +1210,11 @@ export class UserDBDO {
       updates.push('username = ?');
       values.push(body.username);
     }
-    if (hasNewCredential) {
+    if (nextAuthMethod === 'none') {
+      // 切换到 none 时删除旧凭据，不能在以后切回密码/私钥时复用。
+      updates.push('credential = ?');
+      values.push('');
+    } else if (hasNewCredential) {
       const encrypted = await this.encryptCredential(body.credential!, body.user_id);
       updates.push('credential = ?');
       values.push(encrypted);
@@ -1729,6 +1816,50 @@ export class UserDBDO {
     return Response.json({ success: true });
   }
 
+  // ==================== 移动端快捷键配置 ====================
+
+  private handleGetMobileShortcuts(userId: number): Response {
+    type ShortcutRow = { shortcuts_data: string };
+    const rows = this.query<ShortcutRow>(
+      'SELECT shortcuts_data FROM user_mobile_shortcuts WHERE user_id = ?',
+      userId
+    );
+    if (rows.length === 0) {
+      return Response.json({ shortcuts: null });
+    }
+    try {
+      const parsed = JSON.parse(rows[0].shortcuts_data);
+      const normalized = normalizeMobileShortcutsPayload(parsed);
+      if (!normalized) {
+        return Response.json({ shortcuts: null });
+      }
+      return Response.json(normalized);
+    } catch {
+      return Response.json({ shortcuts: null });
+    }
+  }
+
+  private async handlePutMobileShortcuts(request: Request): Promise<Response> {
+    const { user_id, shortcuts_data } = await request.json<{
+      user_id: number;
+      shortcuts_data: string;
+    }>();
+
+    this.db.exec(
+      `INSERT INTO user_mobile_shortcuts (user_id, shortcuts_data, updated_at) VALUES (?, ?, datetime('now'))
+       ON CONFLICT(user_id) DO UPDATE SET shortcuts_data = excluded.shortcuts_data, updated_at = excluded.updated_at`,
+      user_id,
+      shortcuts_data
+    );
+
+    return Response.json({ success: true });
+  }
+
+  private handleDeleteMobileShortcuts(userId: number): Response {
+    this.db.exec('DELETE FROM user_mobile_shortcuts WHERE user_id = ?', userId);
+    return Response.json({ success: true });
+  }
+
   // ==================== One-time-token 连接 ====================
 
   private async handleConnectServer(serverId: number, request: Request): Promise<Response> {
@@ -1763,7 +1894,10 @@ export class UserDBDO {
         const identity =
           index === 0 ? server.host : `jump:${pathSegments.join('>')}|${server.host}`;
         pathSegments.push(`${server.id}@${server.host}:${server.port}`);
-        const credential = await this.decryptCredential(server.credential, body.user_id);
+        const credential =
+          server.auth_method === 'none'
+            ? ''
+            : await this.decryptCredential(server.credential, body.user_id);
         const khRows = this.query<FingerprintRow>(
           'SELECT fingerprint FROM known_hosts WHERE user_id = ? AND host = ? AND port = ?',
           body.user_id,
@@ -1800,7 +1934,10 @@ export class UserDBDO {
       port: node.server.port,
       username: node.server.username,
       password: node.server.auth_method === 'password' ? node.credential : '',
-      authMethod: node.server.auth_method === 'publickey' ? 'publickey' : 'password',
+      authMethod:
+        node.server.auth_method === 'none'
+          ? 'none'
+          : node.server.auth_method === 'publickey' ? 'publickey' : 'password',
       privateKey: node.server.auth_method === 'publickey' ? node.credential : '',
       expectedFingerprint: node.expectedFingerprint,
       knownHostIdentity: node.identity,
@@ -1819,7 +1956,10 @@ export class UserDBDO {
       port: target.port,
       username: target.username,
       password: target.auth_method === 'password' ? targetNode.credential : '',
-      authMethod: target.auth_method === 'publickey' ? 'publickey' : 'password',
+      authMethod:
+        target.auth_method === 'none'
+          ? 'none'
+          : target.auth_method === 'publickey' ? 'publickey' : 'password',
       privateKey: target.auth_method === 'publickey' ? targetNode.credential : '',
       expectedFingerprint: targetNode.expectedFingerprint,
       knownHostIdentity: targetNode.identity,
@@ -2131,7 +2271,7 @@ export class UserDBDO {
 
   private handleGetAIConfig(userId: number): Response {
     const rows = this.query<AIConfigRow>(
-      'SELECT base_url, model, api_key_last4, updated_at FROM ai_configs WHERE user_id = ?',
+      'SELECT base_url, model, api_key_last4, updated_at, context_window, max_output_tokens FROM ai_configs WHERE user_id = ?',
       userId
     );
 
@@ -2146,6 +2286,8 @@ export class UserDBDO {
       model: row.model,
       api_key_last4: row.api_key_last4,
       updated_at: row.updated_at,
+      context_window: row.context_window,
+      max_output_tokens: row.max_output_tokens,
     });
   }
 
@@ -2155,6 +2297,8 @@ export class UserDBDO {
       base_url: string;
       model: string;
       api_key?: string;
+      context_window?: number | null;
+      max_output_tokens?: number | null;
     }>();
 
     if (!body.user_id || !body.base_url || !body.model) {
@@ -2166,8 +2310,8 @@ export class UserDBDO {
     } catch {
       return Response.json({ error: 'Invalid Responses API address', code: 'responses_address' }, { status: 400 });
     }
-    const existing = this.query<{ base_url: string; api_key_enc: string }>(
-      'SELECT base_url, api_key_enc FROM ai_configs WHERE user_id = ?', body.user_id
+    const existing = this.query<AIConfigSecretRow>(
+      'SELECT base_url, model, api_key_enc, context_window, max_output_tokens FROM ai_configs WHERE user_id = ?', body.user_id
     );
     const hasExistingKey = existing.length > 0 && !!existing[0].api_key_enc;
     if (!body.api_key && hasExistingKey) {
@@ -2180,6 +2324,17 @@ export class UserDBDO {
       return Response.json({ error: '首次配置必须填写 API Key' }, { status: 400 });
     }
 
+    let budgets: ReturnType<typeof resolveAIModelBudgets>;
+    const sameModel = existing[0]?.model === body.model && existing[0]?.base_url === body.base_url;
+    try {
+      budgets = resolveAIModelBudgets({
+        context_window: body.context_window === undefined && sameModel ? existing[0]?.context_window : body.context_window,
+        max_output_tokens: body.max_output_tokens === undefined && sameModel ? existing[0]?.max_output_tokens : body.max_output_tokens,
+      });
+    } catch {
+      return Response.json({ error: 'Invalid AI token budgets', code: 'responses_limits' }, { status: 400 });
+    }
+
     let encrypted: string | null = null;
     let last4: string | null = null;
 
@@ -2190,31 +2345,39 @@ export class UserDBDO {
 
     if (encrypted === null) {
       this.db.exec(
-        `INSERT INTO ai_configs (user_id, base_url, model, api_key_enc, api_key_last4, updated_at)
-         VALUES (?, ?, ?, '', '', datetime('now'))
+        `INSERT INTO ai_configs (user_id, base_url, model, api_key_enc, api_key_last4, context_window, max_output_tokens, updated_at)
+         VALUES (?, ?, ?, '', '', ?, ?, datetime('now'))
          ON CONFLICT(user_id) DO UPDATE SET
            base_url = excluded.base_url,
            model = excluded.model,
+           context_window = excluded.context_window,
+           max_output_tokens = excluded.max_output_tokens,
            updated_at = excluded.updated_at`,
         body.user_id,
         body.base_url,
-        body.model
+        body.model,
+        budgets.context_window,
+        budgets.max_output_tokens
       );
     } else {
       this.db.exec(
-        `INSERT INTO ai_configs (user_id, base_url, model, api_key_enc, api_key_last4, updated_at)
-         VALUES (?, ?, ?, ?, ?, datetime('now'))
+        `INSERT INTO ai_configs (user_id, base_url, model, api_key_enc, api_key_last4, context_window, max_output_tokens, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now'))
          ON CONFLICT(user_id) DO UPDATE SET
            base_url = excluded.base_url,
            model = excluded.model,
            api_key_enc = excluded.api_key_enc,
            api_key_last4 = excluded.api_key_last4,
+           context_window = excluded.context_window,
+           max_output_tokens = excluded.max_output_tokens,
            updated_at = excluded.updated_at`,
         body.user_id,
         body.base_url,
         body.model,
         encrypted,
-        last4
+        last4,
+        budgets.context_window,
+        budgets.max_output_tokens
       );
     }
 
@@ -2223,7 +2386,7 @@ export class UserDBDO {
 
   private async handleGetAIConfigDecrypted(userId: number): Promise<Response> {
     const rows = this.query<AIConfigSecretRow>(
-      'SELECT base_url, model, api_key_enc FROM ai_configs WHERE user_id = ?',
+      'SELECT base_url, model, api_key_enc, context_window, max_output_tokens FROM ai_configs WHERE user_id = ?',
       userId
     );
 
@@ -2242,6 +2405,8 @@ export class UserDBDO {
       base_url: row.base_url,
       model: row.model,
       api_key: decrypted,
+      ...(row.context_window != null ? { context_window: row.context_window } : {}),
+      ...(row.max_output_tokens != null ? { max_output_tokens: row.max_output_tokens } : {}),
     });
   }
 

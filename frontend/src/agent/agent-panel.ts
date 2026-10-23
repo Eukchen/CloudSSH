@@ -5,11 +5,13 @@ import { marked, type Tokens } from 'marked';
 import {
   formatTimestampWithRelative,
   isSensitiveKeyOrValue,
+  KNOWLEDGE_VALUE_MAX_LENGTH,
   normalizeKnowledgeInput,
   type ServerKnowledgeItem,
   type UnifiedServerMemory,
 } from '../../../src/server-memory-schema';
 import { copyTextToClipboard } from '../clipboard';
+import { attachDrawerSwipeToClose } from '../drawer-swipe';
 import { getLocale, onLocaleChange, t, translateDocument } from '../i18n';
 import { confirmAction, notify } from '../ui-feedback';
 import { getTerminalFillCommand, normalizeCodeLanguage } from './code-actions';
@@ -104,6 +106,7 @@ export class AgentPanel {
   private autoConfirmTimer: number | null = null;
   private autoConfirmInterval: number | null = null;
   private pendingConfirmation: {
+    confirmationId: string;
     command: string;
     element: HTMLElement;
     previousFocus: HTMLElement | null;
@@ -243,7 +246,7 @@ export class AgentPanel {
         <div class="agent-panel-header flex items-center justify-between px-4 h-12 border-b border-[var(--border)] bg-[var(--bg-elevated)] shrink-0">
           <div class="flex items-center gap-2 min-w-0">
             <span class="material-symbols-outlined text-[var(--accent-secondary)]" style="font-size: 18px; font-variation-settings: 'FILL' 1;">smart_toy</span>
-            <span class="text-xs font-bold tracking-[0.1em] text-[var(--accent-secondary)] truncate" data-i18n="agent.title">AI Agent 助手</span>
+            <span class="agent-panel-title text-xs font-bold tracking-[0.1em] text-[var(--accent-secondary)] truncate" data-i18n="agent.title">AI Agent 助手</span>
           </div>
           <div class="flex items-center gap-1.5">
             <div id="agent-mode-control" class="agent-mode-segmented" role="radiogroup" aria-label="Agent execution mode" data-active-mode="${this.agentMode}">
@@ -356,6 +359,10 @@ export class AgentPanel {
     });
 
     this.parentEl.appendChild(this.panelEl);
+    attachDrawerSwipeToClose(this.panelEl, {
+      headerSelector: '.agent-panel-header',
+      onClose: () => this.hide(),
+    });
     this.messagesEl = this.panelEl.querySelector('#agent-messages');
     this.contextEl = this.panelEl.querySelector('#agent-context');
     this.inputEl = this.panelEl.querySelector('#agent-input') as HTMLTextAreaElement;
@@ -521,7 +528,7 @@ export class AgentPanel {
     // Correlation is local UI state, never an authentication credential.
     if (msg.requestId && msg.requestId !== this.activeRequestId) return;
     if (msg.requestId && !this.isAgentRunning &&
-      ['run_start', 'thinking', 'executing', 'stream_chunk', 'stream_end'].includes(msg.subType)) return;
+      ['run_start', 'thinking', 'executing', 'stream_chunk', 'stream_end', 'context_status'].includes(msg.subType)) return;
     switch (msg.subType) {
       case 'run_start':
         this.isAgentRunning = true;
@@ -552,18 +559,20 @@ export class AgentPanel {
         this.addAgentResponse(msg.messageKey ? t(msg.messageKey) : msg.content);
         break;
       case 'confirm_required':
-        this.showConfirmDialog(msg.command, msg.reason);
+        this.showConfirmDialog(msg.command, msg.reason, msg.confirmationId);
+        break;
+      case 'confirm_closed':
+        if (this.pendingConfirmation?.confirmationId === msg.confirmationId) {
+          this.resolvePendingConfirmation(false, false, msg.confirmationId, false);
+        }
         break;
       case 'error':
-        this.showError(msg.code ? responseErrorMessage(msg.code, msg.status) : msg.message);
+        this.showError(msg.code ? responseErrorMessage(msg.code, msg.status, msg.diagnostics) : msg.message);
         // Pre-run SSH/auth errors have no run_end; protocol errors do.
         if (msg.runId == null) {
           this.isAgentRunning = false;
           this.updateInputState();
         }
-        break;
-      case 'progress_extend':
-        this.showProgressExtend(t('agent.progressContinue'), msg.currentIteration, msg.newMax, t('agent.progressActive'));
         break;
       case 'reset_done':
         if (this.isAgentRunning) break;
@@ -571,8 +580,18 @@ export class AgentPanel {
         this.isAgentRunning = false;
         this.updateInputState();
         break;
+      case 'context_status':
+        if (msg.compacted && msg.checkpointSource === 'local') {
+          notify(t('agent.contextLocalFallback'), { variant: 'warning' });
+        } else if (msg.compacting === true) {
+          notify(t('agent.contextCompacting'), { variant: 'info' });
+        }
+        break;
+      case 'memory_status':
+        notify(t('agent.memoryFailure'), { variant: 'warning' });
+        break;
       case 'memory_updated':
-        if (!this.isAgentRunning) this.clearSessionDraft();
+        // Cache invalidation is not task completion: a late log write must preserve interrupted drafts.
         if (this.serverId) {
           void this.fetchServerMemory();
         }
@@ -1067,8 +1086,13 @@ export class AgentPanel {
         // pi-lens-ignore: no-inner-html, ts-xss-dom-sink
         tmp.innerHTML = this.renderMarkdown(finalContent);
         const inner = tmp.querySelector('.agent-md-content');
-        // pi-lens-ignore: no-inner-html, ts-xss-dom-sink
-        contentEl.innerHTML = inner ? inner.innerHTML : finalContent;
+        if (inner) {
+          // Sanitized renderMarkdown output only; missing wrapper falls back to text.
+          // pi-lens-ignore: no-inner-html, ts-xss-dom-sink
+          contentEl.innerHTML = inner.innerHTML;
+        } else {
+          contentEl.textContent = finalContent;
+        }
         this.enhanceCodeBlocks(contentEl);
       }
       this.attachResponseActions(this.streamingEl, finalContent);
@@ -1094,33 +1118,12 @@ export class AgentPanel {
     this.appendMessage('error', message || t('feedback.danger'));
   }
 
-  private showProgressExtend(
-    message: string,
-    currentIteration: number,
-    newMax: number,
-    reason: string
-  ): void {
-    const el = document.createElement('div');
-    el.className =
-      'agent-progress-extend p-2 rounded border border-[var(--accent)] bg-[var(--accent-bg)] text-[11px]';
-    // pi-lens-ignore: no-inner-html, ts-xss-dom-sink
-    el.innerHTML = `
-      <div class="flex items-center gap-2">
-        <span class="material-symbols-outlined text-[14px]" style="color:var(--accent);font-variation-settings:'FILL' 1;">trending_up</span>
-        <span class="font-bold text-[var(--accent)]">${t('agent.progressTitle')}</span>
-      </div>
-      <div class="agent-progress-detail mt-1">
-        ${escapeHtml(t('agent.progressCurrent', { message, current: currentIteration, max: newMax }))}
-      </div>
-      <div class="agent-progress-detail mt-1 text-[11px]">
-        ${escapeHtml(t('agent.progressReason', { reason }))}
-      </div>
-    `;
-    this.messagesEl?.appendChild(el);
-    this.scrollToBottom();
-  }
-
-  private showConfirmDialog(command: string, reason: string): void {
+  private showConfirmDialog(command: string, reason: string, confirmationId: unknown): void {
+    if (typeof confirmationId !== 'string' || !/^[A-Za-z0-9_-]{16,64}$/.test(confirmationId)) {
+      // Fail closed for legacy/malformed requests; never send an unbound approval.
+      this.wsSend?.(JSON.stringify({ type: 'agent_confirm', approved: false, command, confirmationId }));
+      return;
+    }
     this.clearAutoConfirmTimers();
     if (this.streamingEl) {
       this.convertStreamToThoughtStep();
@@ -1128,7 +1131,7 @@ export class AgentPanel {
     const terminalSectionHidden =
       document.getElementById('terminal-section')?.classList.contains('hidden') ?? false;
     if (!this.isVisible || this.parentEl.style.display === 'none' || terminalSectionHidden) {
-      this.wsSend?.(JSON.stringify({ type: 'agent_confirm', approved: false, command }));
+      this.wsSend?.(JSON.stringify({ type: 'agent_confirm', approved: false, command, confirmationId }));
       return;
     }
     this.rejectPendingConfirmation(false);
@@ -1175,22 +1178,23 @@ export class AgentPanel {
     const rejectButton = el.querySelector<HTMLButtonElement>('.agent-confirm-no')!;
     const confirmButton = el.querySelector<HTMLButtonElement>('.agent-confirm-yes')!;
     this.pendingConfirmation = {
+      confirmationId,
       command,
       element: el,
       previousFocus: document.activeElement instanceof HTMLElement ? document.activeElement : null,
     };
 
     rejectButton.addEventListener('click', () => {
-      this.resolvePendingConfirmation(false);
+      this.resolvePendingConfirmation(false, true, confirmationId);
     });
     confirmButton.addEventListener('click', () => {
-      this.resolvePendingConfirmation(true);
+      this.resolvePendingConfirmation(true, true, confirmationId);
     });
     el.addEventListener('keydown', (event) => {
       if (event.key === 'Escape') {
         event.preventDefault();
         event.stopPropagation();
-        this.resolvePendingConfirmation(false);
+        this.resolvePendingConfirmation(false, true, confirmationId);
         return;
       }
       if (event.key !== 'Tab') return;
@@ -1220,6 +1224,7 @@ export class AgentPanel {
       }
 
       this.autoConfirmInterval = window.setInterval(() => {
+        if (this.pendingConfirmation?.confirmationId !== confirmationId) return;
         remaining -= 1;
         if (remaining > 0 && confirmButton.isConnected) {
           confirmButton.textContent = t('agent.confirmAutoCountdown', { seconds: remaining });
@@ -1232,25 +1237,24 @@ export class AgentPanel {
       }, 1000);
 
       this.autoConfirmTimer = window.setTimeout(() => {
+        if (this.pendingConfirmation?.confirmationId !== confirmationId) return;
         this.clearAutoConfirmTimers();
-        if (this.pendingConfirmation?.command === command) {
-          this.resolvePendingConfirmation(true);
-        }
+        this.resolvePendingConfirmation(true, true, confirmationId);
       }, 3000);
     }
   }
 
-  private resolvePendingConfirmation(approved: boolean, restoreFocus = true): void {
-    this.clearAutoConfirmTimers();
+  private resolvePendingConfirmation(
+    approved: boolean, restoreFocus = true, expectedId?: string, notifyServer = true
+  ): void {
     const pending = this.pendingConfirmation;
-    if (!pending) return;
-
+    if (!pending || (expectedId !== undefined && pending.confirmationId !== expectedId)) return;
+    this.clearAutoConfirmTimers();
     this.pendingConfirmation = null;
-    this.wsSend?.(
+    if (notifyServer) this.wsSend?.(
       JSON.stringify({
-        type: 'agent_confirm',
-        approved,
-        command: pending.command,
+        type: 'agent_confirm', confirmationId: pending.confirmationId,
+        approved, command: pending.command,
       })
     );
     pending.element.remove();
@@ -2369,7 +2373,7 @@ export class AgentPanel {
           <input id="agent-knowledge-key" type="text" placeholder="${t('agent.knowledgeKey')}" class="terminal-input flex-1 text-xs py-1 px-2 rounded border border-[var(--border)] bg-[var(--bg)] font-code text-primary" required maxlength="64" />
         </div>
         <div>
-          <textarea id="agent-knowledge-value" rows="2" placeholder="${t('agent.knowledgeValue')}" class="terminal-input w-full text-xs py-1 px-2 rounded border border-[var(--border)] bg-[var(--bg)] font-code resize-none text-primary" required maxlength="512"></textarea>
+          <textarea id="agent-knowledge-value" rows="2" placeholder="${t('agent.knowledgeValue')}" class="terminal-input w-full text-xs py-1 px-2 rounded border border-[var(--border)] bg-[var(--bg)] font-code resize-none text-primary" required maxlength="${KNOWLEDGE_VALUE_MAX_LENGTH}"></textarea>
         </div>
         <div class="flex justify-end gap-2">
           <button type="button" id="agent-knowledge-cancel-btn" class="px-2 py-0.5 text-xs text-muted hover:text-primary cursor-pointer">${t('agent.memoryCancel')}</button>
